@@ -9,9 +9,11 @@ SECRET_KEY_PASSWORD = ENV['SECRET_KEY_PASSWORD']
 CALENDAR_ID = ENV['CALENDAR_ID']
 SERVICE_ACCOUNT_EMAIL = ENV['SERVICE_ACCOUNT_EMAIL']
 APPLICATION_NAME = ENV['APPLICATION_NAME']
-TERRA_TERM = 3
+TERM_MONTHS = 3
 
-class GoogleCalendar
+class Gcal
+
+  attr_reader :old_events_count, :new_events_count
 
   def initialize
     # Initialize the API
@@ -31,7 +33,18 @@ class GoogleCalendar
     @calendar_api = @client.discovered_api('calendar', 'v3')
   end
 
-  def delete(time_min, time_max)
+  def set_term(today, term_months)
+
+    s = Date.new(today.year, today.month, 1)
+    s = (s << 5) # TODO remove
+    e = (s >> term_months) - 1
+
+    @time_min = Time.local(s.year, s.month, s.day, 0, 0, 0)
+    @time_max = Time.local(e.year, e.month, e.day, 23, 59, 59)
+
+  end
+
+  def delete(time_min = @time_min, time_max = @time_max)
 
     old_events_per_page = @client.execute(:api_method => @calendar_api.events.list,
                                           :parameters =>  {'calendarId' => CALENDAR_ID,
@@ -61,25 +74,60 @@ class GoogleCalendar
                                        'eventId' => event.id})
     end
 
-    @client.execute(batch_delete)
+    @old_events_count = old_events.count
+    @client.execute(batch_delete) if @old_events_count > 0
   end
 
-  def insert(ical)
+  def insert(ical, time_min = @time_min, time_max = @time_max)
     new_events = ical.events
+
+    # 期間チェック
+    events_scoped = []
+    new_events.each do |event|
+      if time_min <= event.dtend && event.dtstart < time_max
+        events_scoped << event
+      end
+    end
+    new_events = events_scoped
 
     # ical -> gcal レイアウト変換
     new_events = new_events.map do |event|
-      {
-        summary: event.summary,
+
+      # 終日イベント
+      allday = (event.dtstart.hour == 0 && event.dtstart.min == 0 && event.dtstart.sec == 0 && event.dtend.hour == 0 && event.dtend.min == 0 && event.dtend.sec == 0)
+
+      # タイトル
+      if event.categories.class == Array && event.categories.length != 0 && event.categories.flatten.first != ""
+        title = "[#{event.categories.flatten.first}] "
+      else
+        title = ""
+      end
+      title = title + "#{event.summary}" if event.present?
+      title = title + " @ #{event.location}" if event.present?
+
+      # 概要
+      description = "開催者: #{event.organizer}"
+      description = description + "\ndescription: #{event.description}" if event.description.present?
+
+      e = {
+        summary: title,
+        description: description,
         location: event.location,
-        description: event.description,
+        organizer: event.organizer,
         start: {dateTime: event.dtstart.iso8601},
         end: {dateTime: event.dtend.iso8601},
         url: event.url.to_s
       }
+
+      if allday
+        e.update({
+          start: {date: Time.local(event.dtstart.year, event.dtstart.month, event.dtstart.day).strftime('%Y-%m-%d')},
+          end: {date: Time.local(event.dtend.year, event.dtend.month, event.dtend.day).strftime('%Y-%m-%d')}
+        })
+      end
+      e
     end
 
-    # カレンダー登録
     batch_insert = Google::APIClient::BatchRequest.new
 
     new_events.each do |event|
@@ -89,21 +137,16 @@ class GoogleCalendar
                        :headers => {'Content-Type' => 'application/json'})
     end
 
-    @client.execute(batch_insert)
+    @new_events_count = new_events.count
+    @client.execute(batch_insert) if @new_events_count > 0
   end
 end
 
-today = Date.today
-s = Date.new(today.year, today.month, 1)
-s = (s << 5) # TODO remove
-e = (s >> TERRA_TERM) - 1
-
-time_min = Time.local(s.year, s.month, s.day, 0, 0, 0)
-time_max = Time.local(e.year, e.month, e.day, 23, 59, 59)
-
-# ical読み込み
 ical = Icalendar.parse(File.read('calendar.ics')).first
 
-gcal = GoogleCalendar.new
-gcal.delete(time_min, time_max)
+gcal = Gcal.new
+gcal.set_term(Date.today, TERM_MONTHS)
+gcal.delete()
 gcal.insert(ical)
+
+puts "Result in deleted events: #{gcal.old_events_count}, inserted events: #{gcal.new_events_count}"
